@@ -6,6 +6,7 @@ coordinate the concurrent access to shared resources. See [wikipedia page][1] ab
 ## Usage
 ```python
 import threading
+import time
 import pymutex
 
 class Counter:
@@ -16,15 +17,29 @@ class Counter:
 def plus_one_thread(mutex, counter, times):
     for _ in range(times):
         mutex.lock()
-        counter += 1
+        counter.value += 1
         mutex.unlock()
 
 def minus_one_thread(mutex, counter, times):
     for _ in range(times):
         mutex.lock()
-        counter += 1
+        counter.value -= 1
         mutex.unlock()
 
+mutex = pymutex.SharedMutex('my_mutex_file')
+counter = Counter()
+t1 = threading.Thread(target=plus_one_thread, args=(mutex, counter, 100_000))
+t2 = threading.Thread(target=plus_one_thread, args=(mutex, counter, 100_000))
+
+mutex.lock() # make the threads wait
+t1.start()
+t2.start()
+time.sleep(0.1)
+mutex.unlock() # let threads work
+t1.join()
+t2.join()
+
+print(f"Value should be zero: {counter.value}")
 ```
 
 ## Requeriments
