@@ -29,6 +29,7 @@ import mmap
 import weakref
 import logging
 import ctypes as c
+from . import utils
 
 
 try:
@@ -48,6 +49,19 @@ else:
 _MUTEX_LOAD_TIMEOUT = 2 # in secs
 _MUTEX_LOCK_HEARTBEAT = 1 # in secs
 
+def configure_default_logging():
+    logger = logging.getLogger('pymutex.SharedMutex')
+    handler = logging.StreamHandler()
+    datetime_fmt = utils.get_local_datetime_fmt()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(name)s in %(short_pathname)s] %(levelname)s: %(message)s",
+            datefmt=f'{datetime_fmt[0]} {datetime_fmt[1]}'
+        )
+    )
+    logger.addHandler(handler)
+
+
 # posix timespec in types/struct_timespec.h
 class _timespec(c.Structure):
     _fields_ = [
@@ -64,13 +78,14 @@ class UninitializedMutexError(Exception):
     """The mutex is in an uninitialized state."""
     pass
 
+
 class _MutexState:
     """This class holds the mutex state because it will be accessed when SharedMutex
     is being garbage collected (through weakref.finalize), that would not be possible
     if a reference to SharedMutex was used. So the reference graph will look like:
-        <your code> -> SharedMutex -> _MutexState
-        weakref.finalize -> _MutexState
-    When SharedMutex is garbage collected, _MutexState is destroyed.
+        <application's code> -> SharedMutex -> _MutexState
+        weakref.finalize() -> _MutexState
+    When SharedMutex is collected by the GC, _MutexState is destroyed.
     """
 
     def __init__(
@@ -79,42 +94,49 @@ class _MutexState:
         self.mutex_ptr = mutex_ptr
         self.mutext_attrs_ptr = mutex_attrs_ptr
         self.fd = mutex_fd
-        self.filepath = filepath
+        self.pathname = pathname
         self.mmap = mutex_mmap
         self.recover_shared_state_cb = recover_shared_state_cb
-        self.logger = logging.getLogger('SharedMutex')
+        self.logger = logging.LoggerAdapter(
+            logging.getLogger('pymutex.SharedMutex'),
+            {'short_pathname': utils.shrink_path(pathname, 2), 'pathname': pathname}
+        )
+
 
 def _mutex_destructor(state: _MutexState):
     """Make sure the mutex is not locked when garbage collected.
     This will not destroy the mutex. If this mutex is freed when locked, all threads
     waiting for this mutex will be in a deadlock."""
     if state.mutex_ptr is None:
-        state.logger.critical("The mutex at '%s' had a null mutex_ptr when being destroyed.", state.filepath)
-        raise RuntimeError("Invalid mutex state")
-    state.logger.debug("Cleaning up the mutex at '%s'", state.filepath)
+        state.logger.critical("The mutex had a null mutex_ptr when being destroyed.")
+        raise RuntimeError("Invalid mutex state.")
+    state.logger.debug("Cleaning up...")
     e = _pt.pthread_mutex_trylock(state.mutex_ptr)
     if e == 0:
         _pt.pthread_mutex_unlock(state.mutex_ptr)
-        state.logger.debug("The mutex '%s' was unlocked", state.filepath)
+        state.logger.debug("The mutex was unlocked.")
     elif e == errno.EDEADLOCK:
         _pt.pthread_mutex_unlock(state.mutex_ptr)
-        state.logger.error("The mutex '%s' was locked when cleaning up.", state.filepath)
+        state.logger.critical("The mutex was locked when cleaning up.")
     elif e == errno.EOWNERDEAD:
         try:
+            state.logger.warning('Caught a deadlock, recovering the mutex...')
             if state.recover_shared_state_cb():
                 _pt.pthread_mutex_consistent(state.mutex_ptr)
+            else:
+                state.logger.warning("This mutex was marked as inconsistent, it can't be locked from now. Any attempt to lock it will result in InvalidSharedState error.")
         finally:
             _pt.pthread_mutex_unlock(state.mutex_ptr)
-    else:
+    elif e != errno.EBUSY:
         state.logger.error(
-            "Got the error (%s: %s) when trying to check if the mutex '%s' was locked. Cleaning the mutex anyway...",
+            "Got the error (%s: %s) when trying to check if the mutex was locked. Cleaning it anyway...",
             errno.errorcode[e], os.strerror(e), state.filepath
         )
     state.mutex_ptr = None
     state.mutext_attrs_ptr = None
     os.close(state.fd)
-    state.mmap.close()
-    state.logger.debug("Mutex '%s' cleaned.", state.filepath)
+    state.mmap = None # let gc collect it later
+    state.logger.debug("Mutex cleaned.", state.filepath)
 
 
 class SharedMutex:
@@ -138,7 +160,7 @@ class SharedMutex:
         protected by this mutex is consistent. This callback takes no argument and must
         return True if the shared state is consistent, False otherwise. The current thread
         owns the lock (don't try to unlock). If the shared state is marked as inconsistent, the
-        mutex will be unusable and any attempt to lock it results in an OSError [ENOTRECOVERABLE]
+        mutex will be unusable and any attempt to lock it results in InvalidSharedState error
         (see man pages of pthread_mutex_lock for more details). This callback MUST NOT keep any
         direct or indirect reference to this mutex, otherwise it is not granted that this mutex
         will be cleaned up correctly.
@@ -220,7 +242,7 @@ class SharedMutex:
             return True
 
     def unlock(self):
-        """Unlock the mutex. Raises OSError (EPERM) if the current thread does not owns the lock."""
+        """Unlock the mutex. Raises PermissionError if the current thread does not owns the lock."""
         if self._state.mutex_ptr is None: raise RuntimeError('Invalid mutex state')
         e = _pt.pthread_mutex_unlock(self._state.mutex_ptr)
         if e != 0:

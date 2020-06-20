@@ -30,15 +30,21 @@ import subprocess
 import tempfile
 import secrets
 import unittest
+import logging
+import warnings
 from unittest import mock
 from pymutex import mutex
 
+
 BASEDIR = os.path.dirname(__file__)
+
 
 class SharedMutexTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        mutex.configure_default_logging()
+        logging.getLogger('pymutex').setLevel(logging.CRITICAL + 1)
         cls.mutex_filepath = maketempfilepath()
         return super().setUpClass()
 
@@ -61,7 +67,6 @@ class SharedMutexTest(unittest.TestCase):
             counter.value -= 1
             self.mutex.unlock()
 
-    @unittest.skip('none')
     def test_thread_sincronization_in_same_process(self):
         counter = Counter()
         t1 = threading.Thread(target=self._plus_one, args=(counter, 100_000))
@@ -77,8 +82,8 @@ class SharedMutexTest(unittest.TestCase):
         self.assertEqual(counter.value, 0)
         self.recover.assert_not_called()
 
-    @unittest.skip('none')
     def test_thread_sincronization_across_processes(self):
+        warnings.simplefilter("ignore", ResourceWarning)
         tmpfile = maketempfilepath()
         self.mutex.lock()
         p1 = subprocess.Popen(
@@ -102,7 +107,6 @@ class SharedMutexTest(unittest.TestCase):
         self.assertEqual(p1.stdout.readline(), '0')
         self.assertEqual(p2.stdout.readline(), '0')
 
-    @unittest.skip('none')
     def test_should_call_recover_shared_state_callback_when_a_thread_terminates_without_unlocking_the_mutex(self):
         t = threading.Thread(target=lambda: self.mutex.lock())
         t.start()
@@ -110,7 +114,6 @@ class SharedMutexTest(unittest.TestCase):
         self.mutex.lock()
         self.recover.assert_called_once_with()
 
-    @unittest.skip('none')
     def test_should_raise_OSError_EDEADLOCK_when_relock(self):
         self.mutex.lock()
         try:
@@ -119,7 +122,6 @@ class SharedMutexTest(unittest.TestCase):
         except OSError as e:
             self.assertEqual(e.errno, errno.EDEADLOCK, f'Raised [{e.errno} {os.strerror(e.errno)}] instead of EDEADLOCK.')
 
-    @unittest.skip('none')
     def test_should_raise_PermissionError_when_unlock_not_owned_lock(self):
         with self.assertRaises(PermissionError):
             self.mutex.unlock()
@@ -139,6 +141,7 @@ class SharedMutexTest(unittest.TestCase):
         self.mutex.lock()
         with self.assertRaises(OSError):
             mutex2.lock(blocking=False)
+
 
 def maketempfilepath():
     for _ in range(100):
