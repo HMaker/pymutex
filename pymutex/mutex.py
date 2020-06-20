@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2020 Heraldo Lucena
+# Copyright (c) 2020 HMaker
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -55,7 +55,7 @@ def configure_default_logging():
     datetime_fmt = utils.get_local_datetime_fmt()
     handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s [%(name)s in %(short_pathname)s] %(levelname)s: %(message)s",
+            "%(asctime)s [%(name)s in %(short_mutex_pathname)s] %(levelname)s: %(message)s",
             datefmt=f'{datetime_fmt[0]} {datetime_fmt[1]}'
         )
     )
@@ -92,18 +92,17 @@ class _MutexState:
         self, pathname: str, mutex_ptr, mutex_attrs_ptr, mutex_fd: int,
         mutex_mmap: mmap.mmap, recover_shared_state_cb):
         self.mutex_ptr = mutex_ptr
-        self.mutext_attrs_ptr = mutex_attrs_ptr
+        self.mutex_attrs_ptr = mutex_attrs_ptr
         self.fd = mutex_fd
-        self.pathname = pathname
         self.mmap = mutex_mmap
         self.recover_shared_state_cb = recover_shared_state_cb
         self.logger = logging.LoggerAdapter(
             logging.getLogger('pymutex.SharedMutex'),
-            {'short_pathname': utils.shrink_path(pathname, 2), 'pathname': pathname}
+            {'short_mutex_pathname': utils.shrink_path(pathname, 2), 'mutex_pathname': pathname}
         )
 
 
-def _mutex_destructor(state: _MutexState):
+def _mutex_finalizer(state: _MutexState):
     """Make sure the mutex is not locked when garbage collected.
     This will not destroy the mutex. If this mutex is freed when locked, all threads
     waiting for this mutex will be in a deadlock."""
@@ -117,7 +116,7 @@ def _mutex_destructor(state: _MutexState):
         state.logger.debug("The mutex was unlocked.")
     elif e == errno.EDEADLOCK:
         _pt.pthread_mutex_unlock(state.mutex_ptr)
-        state.logger.critical("The mutex was locked when cleaning up.")
+        state.logger.critical("The mutex was locked when cleaning up. Unlocking...")
     elif e == errno.EOWNERDEAD:
         try:
             state.logger.warning('Caught a deadlock, recovering the mutex...')
@@ -141,7 +140,7 @@ def _mutex_destructor(state: _MutexState):
 
 class SharedMutex:
     """A POSIX robust mutex that is shareable across processes.
-    The sharing is done by memory mapping a file that contains the mutex state.
+    The sharing is done by memory mapping a file that contains the mutex's state.
     """
 
     def __init__(self, mutex_file: str, recover_shared_state_cb):
@@ -152,7 +151,7 @@ class SharedMutex:
 
         Parameters
         ----------
-        1. mutex_file: The filepath of the shared mutex
+        1. mutex_file: The pathname of the shared mutex
 
         2. recover_shared_state_cb (callable):
         The callback that is called when the last thread that locked this mutex terminated
@@ -177,7 +176,7 @@ class SharedMutex:
         except FileExistsError:
             # Try to mmap it
             self._mutex_load(mutex_file, recover_shared_state_cb)
-            weakref.finalize(self, _mutex_destructor, self._state)
+            self._finalizer = weakref.finalize(self, _mutex_finalizer, self._state)
             return
         try:
             mutex_attrs = c.create_string_buffer(_PTHREAD_MUTEX_ATTRS_SIZE)
@@ -219,7 +218,7 @@ class SharedMutex:
             os.close(mutex_fd)
             raise
         self._state = _MutexState(mutex_file, c.byref(mutex), mutex_attrs_ptr, mutex_fd, mutex_mmap, recover_shared_state_cb)
-        weakref.finalize(self, _mutex_destructor, self._state)
+        self._finalizer = weakref.finalize(self, _mutex_finalizer, self._state)
 
     def lock(self, blocking: bool = True, timeout: float = 0):
         """Lock the mutex. If "blocking" is True, the current thread
@@ -237,6 +236,7 @@ class SharedMutex:
             return self._mutex_timedlock(_MUTEX_LOCK_HEARTBEAT)
         else:
             e = _pt.pthread_mutex_trylock(self._state.mutex_ptr)
+            #breakpoint()
             if e != 0:
                 return self._mutex_lock_handle_error(e)
             return True
@@ -284,12 +284,12 @@ class SharedMutex:
                     if e != 0:
                         raise OSError(e, os.strerror(e))
                     return True
-                raise InvalidSharedState('The shared state could not be recovered by .recover_shared_state()')
+                raise InvalidSharedState('The shared state could not be recovered by recover_shared_state callback.')
             except:
                 self.unlock()
                 raise
         elif e == errno.ENOTRECOVERABLE:
-            raise InvalidSharedState('The shared state could not be recovered by .recover_shared_state()')
+            raise InvalidSharedState('The shared state could not be recovered by recover_shared_state callback.')
         else:
             raise OSError(e, os.strerror(e))
     
@@ -305,7 +305,7 @@ class SharedMutex:
                 break
             except PermissionError:
                 if attempts * 0.2 >= _MUTEX_LOAD_TIMEOUT:
-                    raise TimeoutError(f'The loading of the mutex {mutex_file} timed out.')
+                    raise TimeoutError(f"The loading of the mutex in '{mutex_file}' timed out. Check whether other process terminated when initializing the mutex and remove the file.")
                 attempts += 1
                 time.sleep(0.2)
         mutex_mmap = mmap.mmap(mutex_fd, 0, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
