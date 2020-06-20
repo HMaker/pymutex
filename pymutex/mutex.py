@@ -89,7 +89,7 @@ class _MutexState:
     """
 
     def __init__(
-        self, filepath: str, mutex_ptr, mutex_attrs_ptr, mutex_fd: int,
+        self, pathname: str, mutex_ptr, mutex_attrs_ptr, mutex_fd: int,
         mutex_mmap: mmap.mmap, recover_shared_state_cb):
         self.mutex_ptr = mutex_ptr
         self.mutext_attrs_ptr = mutex_attrs_ptr
@@ -130,13 +130,13 @@ def _mutex_destructor(state: _MutexState):
     elif e != errno.EBUSY:
         state.logger.error(
             "Got the error (%s: %s) when trying to check if the mutex was locked. Cleaning it anyway...",
-            errno.errorcode[e], os.strerror(e), state.filepath
+            errno.errorcode[e], os.strerror(e)
         )
     state.mutex_ptr = None
     state.mutext_attrs_ptr = None
     os.close(state.fd)
     state.mmap = None # let gc collect it later
-    state.logger.debug("Mutex cleaned.", state.filepath)
+    state.logger.debug("Mutex cleaned.")
 
 
 class SharedMutex:
