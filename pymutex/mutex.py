@@ -40,10 +40,16 @@ except OSError as e:
 # pthread structs' size from pthreadtypes-arch.h
 _PTHREAD_MUTEX_ATTRS_SIZE = 4
 import platform as _platform
-if _platform.machine() == 'x86_64':
-    _PTHREAD_MUTEX_SIZE = 40
-else:
+_arch = _platform.architecture()[0]
+if _arch == '64bit':
+    if c.sizeof(c.POINTER(c.c_int)) == 8:
+        _PTHREAD_MUTEX_SIZE = 40
+    else:
+        _PTHREAD_MUTEX_SIZE = 32
+elif _arch == '32bit':
     _PTHREAD_MUTEX_SIZE = 24
+else:
+    raise ImportError(f'Unknown platform architecture: {_arch}')
 
 
 _MUTEX_LOAD_TIMEOUT = 2 # in secs
@@ -94,7 +100,6 @@ class _MutexState:
         self.mutex_ptr = mutex_ptr
         self.mutex_attrs_ptr = mutex_attrs_ptr
         self.locked = False
-        self.owner = None
         self.fd = mutex_fd
         self.mmap = mutex_mmap
         self.recover_shared_state_cb = recover_shared_state_cb
@@ -105,39 +110,18 @@ class _MutexState:
 
 
 def _mutex_finalizer(state: _MutexState):
-    """Make sure the mutex is not locked when garbage collected.
-    This will not destroy the mutex. If this mutex is freed when locked, all threads
+    """This will not destroy the mutex. If this mutex is freed when locked, all threads
     waiting for this mutex will be in a deadlock."""
-    if state.mutex_ptr is None:
-        state.logger.critical("The mutex had a null mutex_ptr when being destroyed.")
-        raise RuntimeError("Invalid mutex state.")
     state.logger.debug("Cleaning up...")
-    e = _pt.pthread_mutex_trylock(state.mutex_ptr)
-    if e == 0:
-        _pt.pthread_mutex_unlock(state.mutex_ptr)
-        state.logger.debug("The mutex was unlocked.")
-    elif e == errno.EDEADLOCK:
-        _pt.pthread_mutex_unlock(state.mutex_ptr)
-        state.logger.critical("The mutex was locked when cleaning up. Unlocking...")
-    elif e == errno.EOWNERDEAD:
-        try:
-            state.logger.warning('Caught a deadlock, recovering the mutex...')
-            if state.recover_shared_state_cb():
-                _pt.pthread_mutex_consistent(state.mutex_ptr)
-            else:
-                state.logger.warning("This mutex was marked as inconsistent, it can't be locked from now. Any attempt to lock it will result in InvalidSharedState error.")
-        finally:
-            _pt.pthread_mutex_unlock(state.mutex_ptr)
-    elif e != errno.EBUSY:
-        state.logger.error(
-            "Got the error (%s: %s) when trying to check if the mutex was locked. Cleaning it anyway...",
-            errno.errorcode[e], os.strerror(e)
-        )
+    if state.mutex_ptr is None:
+        state.logger.critical("The mutex had a null mutex_ptr when being cleaned.")
+    if state.locked:
+        state.logger.critical("Possible deadlock! This mutex was left locked.")
     state.mutex_ptr = None
     state.mutext_attrs_ptr = None
     os.close(state.fd)
     state.mmap.flush()
-    state.mmap = None # let gc collect it later
+    state.mmap.close() # let gc collect it later
     state.logger.debug("Mutex cleaned.")
 
 
@@ -223,6 +207,11 @@ class SharedMutex:
         self._state = _MutexState(mutex_file, c.byref(mutex), mutex_attrs_ptr, mutex_fd, mutex_mmap, recover_shared_state_cb)
         self._finalizer = weakref.finalize(self, _mutex_finalizer, self._state)
 
+    @property
+    def owns_lock(self):
+        """Returns True if this mutex instance owns the lock, False otherwise."""
+        return self._state.locked
+
     def lock(self, blocking: bool = True, timeout: float = 0):
         """Lock the mutex. If "blocking" is True, the current thread
         blocks until the mutex becomes available, if "timeout" > 0 the
@@ -235,22 +224,31 @@ class SharedMutex:
             # without releasing it. The blocking call will be made of
             # several calls to pthread_mutex_timedlock.
             if timeout > 0:
-                return self._mutex_timedlock(timeout, False)
-            return self._mutex_timedlock(_MUTEX_LOCK_HEARTBEAT)
+                locked = self._mutex_timedlock(timeout, False)
+            else:
+                locked = self._mutex_timedlock(_MUTEX_LOCK_HEARTBEAT)
         else:
             e = _pt.pthread_mutex_trylock(self._state.mutex_ptr)
-            #breakpoint()
-            if e != 0:
-                return self._mutex_lock_handle_error(e)
+            if e == 0:
+                locked = True
+            else:
+                locked = self._mutex_lock_handle_error(e)
+
+        if locked:
+            self._state.locked = True
             return True
+        else:
+            return False
 
     def unlock(self):
         """Unlock the mutex. Raises PermissionError if the current thread does not owns the lock."""
         if self._state.mutex_ptr is None: raise RuntimeError('Invalid mutex state')
         e = _pt.pthread_mutex_unlock(self._state.mutex_ptr)
-        if e != 0:
-            if e == errno.EINVAL:
-                raise UninitializedMutexError()
+        if e == 0:
+            self._state.locked = False
+        elif e == errno.EINVAL:
+            raise UninitializedMutexError()
+        else:
             raise OSError(e, os.strerror(e))
 
     def _mutex_timedlock(self, timeout: float, until_lock = True):
@@ -282,16 +280,19 @@ class SharedMutex:
             # make sure the shared state is consistent.
             # The current thread owns the lock
             try:
+                self._state.logger.warning("The last thread holding the lock left it locked, recovering...")
                 if self._state.recover_shared_state_cb():
                     e = _pt.pthread_mutex_consistent(self._state.mutex_ptr)
                     if e != 0:
                         raise OSError(e, os.strerror(e))
                     return True
+                self._state.logger.warning("The shared state could not be recovered, this mutex is unusable from now.")
                 raise InvalidSharedState('The shared state could not be recovered by recover_shared_state callback.')
             except:
                 self.unlock()
                 raise
         elif e == errno.ENOTRECOVERABLE:
+            self._state.logger.warning("This mutex is unusable, it must be removed.")
             raise InvalidSharedState('The shared state could not be recovered by recover_shared_state callback.')
         else:
             raise OSError(e, os.strerror(e))

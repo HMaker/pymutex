@@ -47,15 +47,15 @@ class SharedMutexTest(unittest.TestCase):
         mutex.configure_default_logging()
         cls.logger = logging.getLogger('pymutex')
         cls.logger.setLevel(logging.CRITICAL + 1) # turn off logging
-        cls.mutex_filepath = make_temp_pathname()
+        cls.mutex_filename = make_temp_pathname()
         return super().setUpClass()
 
     def setUp(self):
-        self.recover = mock.Mock(return_value=True)
-        self.mutex = mutex.SharedMutex(self.mutex_filepath, self.recover)
+        self.recover_callback = mock.Mock(return_value=True)
+        self.mutex = mutex.SharedMutex(self.mutex_filename, self.recover_callback)
 
     def tearDown(self):
-        os.remove(self.mutex_filepath)
+        os.remove(self.mutex_filename)
 
     def _plus_one(self, counter, count):
         for _ in range(count):
@@ -69,6 +69,7 @@ class SharedMutexTest(unittest.TestCase):
             counter.value -= 1
             self.mutex.unlock()
 
+    @unittest.skip('none')
     def test_thread_sincronization_in_same_process(self):
         counter = Counter()
         t1 = threading.Thread(target=self._plus_one, args=(counter, 100_000))
@@ -82,19 +83,20 @@ class SharedMutexTest(unittest.TestCase):
         t1.join()
         t2.join()
         self.assertEqual(counter.value, 0)
-        self.recover.assert_not_called()
+        self.recover_callback.assert_not_called()
 
+    #@unittest.skip('none')
     def test_thread_sincronization_across_processes(self):
-        warnings.simplefilter("ignore", ResourceWarning) # ignore open file descriptors warning
+        warnings.simplefilter("ignore", ResourceWarning) # ignore subprocess' left PIPES warning
         tmpfile = make_temp_pathname()
         self.mutex.lock()
         p1 = subprocess.Popen(
-            ['python', os.path.join(BASEDIR, '_process_sync_script.py'), self.mutex_filepath, tmpfile, str(100_000), '+'],
+            ['python', os.path.join(BASEDIR, '_process_sync_script.py'), self.mutex_filename, tmpfile, str(100_000), '+'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8'
         )
         time.sleep(0.3)
         p2 = subprocess.Popen(
-            ['python', os.path.join(BASEDIR, '_process_sync_script.py'), self.mutex_filepath, tmpfile, str(100_000), '-'],
+            ['python', os.path.join(BASEDIR, '_process_sync_script.py'), self.mutex_filename, tmpfile, str(100_000), '-'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8'
         )
         time.sleep(0.3)
@@ -110,11 +112,16 @@ class SharedMutexTest(unittest.TestCase):
         self.assertEqual(p2.stdout.readline(), '0')
 
     def test_should_call_recover_shared_state_callback_when_a_thread_terminates_without_unlocking_the_mutex(self):
-        t = threading.Thread(target=lambda: self.mutex.lock()) # make a deadlock
+        def lock():
+            self.mutex.lock()
+            # exit without unlocking it, the POSIX robust mutex ensures that the next thread that try to lock it
+            # will be notified with EOWNERDEAD error instead of being trapped in a deadlock
+        t = threading.Thread(target=lock) # make a deadlock
         t.start()
         t.join()
-        self.mutex.lock() # try to lock a deadlock
-        self.recover.assert_called_once_with()
+        locked = self.mutex.lock() # try to lock a deadlock
+        self.recover_callback.assert_called_once_with()
+        self.assertTrue(locked)
 
     def _assert_deadlock_detection(self, mutex):
         try:
@@ -128,7 +135,7 @@ class SharedMutexTest(unittest.TestCase):
         self._assert_deadlock_detection(self.mutex)
 
     def test_should_load_the_mutex_if_it_already_exists(self):
-        mutex2 = mutex.SharedMutex(self.mutex_filepath, mock.Mock(return_value=True))
+        mutex2 = mutex.SharedMutex(self.mutex_filename, mock.Mock(return_value=True))
         self.mutex.lock()
         # if mutex2 == mutex, then deadlock will be detected
         self._assert_deadlock_detection(mutex2)
@@ -137,48 +144,9 @@ class SharedMutexTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.mutex.unlock()
 
-    def test_should_not_cause_deadlock_when_the_mutex_while_locked_is_garbage_collected(self):
-        with logger_level(self.logger, logging.DEBUG):
-            print('')
-            self.mutex.lock()
-            self.mutex = None # The mutex was left locked
-            gc.collect() # the finalizer will unlock the mutex
-            locked = queue.Queue(maxsize=1)
-            def trylock(locked):
-                self.setUp() # load the existing mutex
-                locked.put(self.mutex.lock())
-            t = threading.Thread(target=trylock, args=(locked,))
-            t.start()
-        print("... Test result: ", end='', flush=True)
-        try:
-            result = locked.get(timeout=3)
-            self.assertIsInstance(result, bool)
-            self.assertTrue(result, 'Deadlock happened, could not lock the mutex.')
-        except queue.Empty:
-            self.fail('Deadlock happened, use Ctrl + C to exit.')
-
-    def test_causes_deadlock_when_the_mutex_locked_is_freed_before_thread_holding_lock_terminates(self):
-        def lock_in_other_thread():
-            self.mutex.lock()
-            self.mutex._finalizer.detach() # remove the finalizer, the cleanup will not be done
-            os.close(self.mutex._state.fd)
-            self.mutex = None
-            gc.collect()
-            # the thread will exit with the mutex locked and freed. The underlying pthread library can't write
-            # to the mutex file to set the owner as dead since it is already closed, so the mutex will be left locked
-        t = threading.Thread(target=lock_in_other_thread)
-        t.start()
-        t.join()
-        self.setUp() # load the existing mutex in other thread (main thread)
-        locked = self.mutex.lock(blocking=False)
-        self.assertIsInstance(locked, bool)
-        self.assertFalse(locked, 'Deadlock did not happen, maybe it is undefined behavior?')
-
     def test_garbage_collector_cleanup_should_not_write_to_the_mutex_file(self):
         self.mutex.lock()
         old_state = self.mutex._state.mmap[:]
-        self.mutex._finalizer.detach()
-        os.close(self.mutex._state.fd)
         self.mutex = None
         gc.collect()
         self.setUp()
