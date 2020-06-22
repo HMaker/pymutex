@@ -93,6 +93,8 @@ class _MutexState:
         mutex_mmap: mmap.mmap, recover_shared_state_cb):
         self.mutex_ptr = mutex_ptr
         self.mutex_attrs_ptr = mutex_attrs_ptr
+        self.locked = False
+        self.owner = None
         self.fd = mutex_fd
         self.mmap = mutex_mmap
         self.recover_shared_state_cb = recover_shared_state_cb
@@ -134,6 +136,7 @@ def _mutex_finalizer(state: _MutexState):
     state.mutex_ptr = None
     state.mutext_attrs_ptr = None
     os.close(state.fd)
+    state.mmap.flush()
     state.mmap = None # let gc collect it later
     state.logger.debug("Mutex cleaned.")
 

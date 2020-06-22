@@ -6,12 +6,30 @@ coordinate the concurrent access to shared resources. See [wikipedia page][1] ab
 
 The `pymutex.SharedMutex` implements the features that allows mutexes to be shared across processes, it is similar to named semaphores in a sense that its state is stored in a file of the filesystem and visible system-wide. When passing a `pathname` to its constructor, the SharedMutex will check whether that file already exists, if so it will try to load the stored mutex. If the file does not exists, it will be created in read-only mode, the SharedMutex instance that created the file is responsible for initializing a new mutex and storing it in that file. When other SharedMutex instances see the file already exists but is in read-only mode, they will pool the file and wait until it becomes writable.
 
+## Requeriments
+1. It was tested only in Python 3.7, probably it works in python 3.8, 3.6 and 3.5 too;
+2. [libpthread][3], which comes by default in Linux systems.
+   
+    \* There are no external dependencies.
+
 ## Usage
+`SharedMutex.lock(blocking, timeout)` locks/acquires the mutex, if the mutex is not available (other thread already acquired it), then the caller's thread blocks until the mutex becomes available. If a `timeout` is given (defaults to zero), the thread waits until `timeout` expires. If `blocking=False` is given (defaults to `True`), the call returns immediately, the returned value is `True` if the mutex was acquired, `False` otherwise.
+
+`SharedMutex.unlock()` unlocks/releases the mutex, in effect it becomes available.<br>
+The mutex is also unlocked when left locked and collected by the gargabe collector (GC), since it is understood that if there is no reference to a mutex, it is not being used. Also it would become a deadlock.<br>
+```python
+import pymutex
+
+mutex = pymutex.SharedMutex('my_mutex')
+mutex.lock()
+mutex = None # there are no more references to the mutex, it will be unlocked when collected by the GC
+```
+
 The following code shows a classic example of data races. There are 2 threads that concurrently tries to
 increment and decrement the counter's value. Python grants atomic operations on its data types, but it
 won't try to coordinate the concurrent access to the counter's value, it is up to the application code.
 The example below grants that the end counter's value will be zero by making sure that an increment
-operation is followed by a decrement one.
+operation is followed by a decrement one (here the lock acquisition is done in a FIFO way, the first to ask will be the first to acquire.).
 ```python
 import threading
 import time
@@ -51,18 +69,12 @@ print(f"Value should be zero: {counter.value}")
 ```
 Remove the `mutex.lock()` and `mutex.unlock()` from the `increment` and `decrement` loops to see what happens.
 
-## Requeriments
-1. It was tested only in Python 3.7, probably it works in python 3.8, 3.6 and 3.5 too;
-2. `libpthread`, which comes by default in Linux systems.
-
-There are no external dependencies.
-
 ## Known deadlock situations
-The POSIX's mutex configured with robustness and errorcheck type is able to avoids several deadlock situations like 1) a thread holding the lock terminates without releasing it 2) a thread tries to lock an already owned lock 3) a thread tries to unlock a not owned lock, but it only works with valid mutexes. If a mutex is locked and collected by the Python's garbage collector, all operations on the mutex after that are undefined behavior. To avoid that, a weakref finalizer is registered for each instance of `SharedMutex` that makes sure the mutex is not locked when garbage collected. Applications MUST follow the rules that allows those finalizers to work, see [weakref.finalize][2] for full documentation.
+The POSIX's mutex configured with robustness and errorcheck type (internally identified as `PTHREAD_MUTEX_ROBUST_ERRORCHECK_NP` by pthread) is able to avoid several deadlock situations like 1) a thread holding the lock terminates without releasing it 2) a thread tries to lock an already owned lock 3) a thread tries to unlock a not owned lock, but it only works for valid mutexes. If a mutex is locked and collected by the Python's garbage collector, all operations on the mutex after that are undefined behavior. To avoid that, a weakref finalizer is registered for each instance of `SharedMutex` that makes sure the mutex is not locked when garbage collected. Applications MUST follow the rules that allows those finalizers to work, see [weakref.finalize][2] for full documentation. __Note__ that it only works when the mutex is being cleaned in the __thread it was acquired__.
 
-Since the `SharedMutex` is supposed to be shared across processes, the underlying pthread mutex will be never destoyed by calling `pthread_mutex_destroy`. The `SharedMutex` does not keeps track of the references to the same mutex, it just makes sure it will not leave the mutex in an invalid state. Applications MUST ensure that the mutex is not destroyed, if so, they MUST notify all threads waiting for the mutex. Operating a destroyed mutex is undefined behavior.
+Since the `SharedMutex` is supposed to be shared across processes, the underlying pthread mutex will be never destoyed by calling `pthread_mutex_destroy`. The `SharedMutex` does not keeps track of the references to the same mutex, it just makes sure it will not leave the mutex in an invalid state. Internally all [pthread_mutex_destroy][4] does is just set the mutex type to an invalid value (-1), but before doing so it checks whether the mutex is robust, if it is and some other thread locked this mutex, it returns `EBUSY` error. All other operations of `_timedlock`, `_trylock` and `_unlock` checks the mutex type to select the appropriate action. When the type can't be determined, `EINVAL` error is returned.
 
-The mutex's state is stored in a file which is memory mapped by processes that want to use them. Applications MUST ensure that all writes to that file will not make the mutex invalid. Ideally that file should be written only by `pthread_mutex_*` functions. The `SharedMutex` class gives write and read permissions only to the process's user where the mutex was initialized.
+The mutex's state is stored in a file which is memory mapped by processes that want to use them. Applications MUST ensure that all writes to that file will not make the mutex invalid. Ideally that file should be written only by `pthread_mutex_*` functions. The `SharedMutex` class gives write and read permissions only to the process's user where the mutex was initialized. This file MUST NOT persist more than one session, applications MUST remove the file when all threads interested in terminates. Internally pthread uses threads' ID and other volatile values, those values changes when the processes restart.
 
 
 ## Testing
@@ -77,3 +89,5 @@ This work is licensed under MIT License, See LICENSE for more info.
 
 [1]: https://en.wikipedia.org/wiki/Mutual_exclusion
 [2]: https://docs.python.org/3.7/library/weakref.html#weakref.finalize
+[3]: http://sourceware.org/git/?p=glibc.git;a=tree;f=nptl;hb=HEAD
+[4]: http://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/pthread_mutex_destroy.c;h=e2c9f8a39ffe81e046f370c34e86a3696bb431e9;hb=HEAD

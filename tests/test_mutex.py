@@ -142,10 +142,10 @@ class SharedMutexTest(unittest.TestCase):
             print('')
             self.mutex.lock()
             self.mutex = None # The mutex was left locked
-            gc.collect()
-            self.setUp() # load the existing mutex
+            gc.collect() # the finalizer will unlock the mutex
             locked = queue.Queue(maxsize=1)
             def trylock(locked):
+                self.setUp() # load the existing mutex
                 locked.put(self.mutex.lock())
             t = threading.Thread(target=trylock, args=(locked,))
             t.start()
@@ -157,20 +157,33 @@ class SharedMutexTest(unittest.TestCase):
         except queue.Empty:
             self.fail('Deadlock happened, use Ctrl + C to exit.')
 
-    def test_causes_deadlock_when_the_mutex_is_locked_and_its_finalizer_is_not_ran(self):
+    def test_causes_deadlock_when_the_mutex_locked_is_freed_before_thread_holding_lock_terminates(self):
+        def lock_in_other_thread():
+            self.mutex.lock()
+            self.mutex._finalizer.detach() # remove the finalizer, the cleanup will not be done
+            os.close(self.mutex._state.fd)
+            self.mutex = None
+            gc.collect()
+            # the thread will exit with the mutex locked and freed. The underlying pthread library can't write
+            # to the mutex file to set the owner as dead since it is already closed, so the mutex will be left locked
+        t = threading.Thread(target=lock_in_other_thread)
+        t.start()
+        t.join()
+        self.setUp() # load the existing mutex in other thread (main thread)
+        locked = self.mutex.lock(blocking=False)
+        self.assertIsInstance(locked, bool)
+        self.assertFalse(locked, 'Deadlock did not happen, maybe it is undefined behavior?')
+
+    def test_garbage_collector_cleanup_should_not_write_to_the_mutex_file(self):
         self.mutex.lock()
-        self.mutex._finalizer.detach() # remove the finalizer, the cleanup will not be done
+        old_state = self.mutex._state.mmap[:]
+        self.mutex._finalizer.detach()
+        os.close(self.mutex._state.fd)
         self.mutex = None
         gc.collect()
-        self.setUp() # load the existing mutex
-        locked = queue.Queue(maxsize=1)
-        def trylock(locked):
-            locked.put(self.mutex.lock(blocking=False))
-        t = threading.Thread(target=trylock, args=(locked,))
-        t.start()
-        result = locked.get()
-        self.assertIsInstance(result, bool)
-        self.assertFalse(result, 'Deadlock did not happen, maybe the bug does not exists anymore?')
+        self.setUp()
+        new_state = self.mutex._state.mmap[:]
+        self.assertEqual(new_state, old_state)
 
 
 def make_temp_pathname():
