@@ -25,7 +25,6 @@ import os
 import errno
 import gc
 import threading
-import queue
 import time
 import subprocess
 import tempfile
@@ -69,7 +68,6 @@ class SharedMutexTest(unittest.TestCase):
             counter.value -= 1
             self.mutex.unlock()
 
-    @unittest.skip('none')
     def test_thread_sincronization_in_same_process(self):
         counter = Counter()
         t1 = threading.Thread(target=self._plus_one, args=(counter, 100_000))
@@ -85,7 +83,6 @@ class SharedMutexTest(unittest.TestCase):
         self.assertEqual(counter.value, 0)
         self.recover_callback.assert_not_called()
 
-    #@unittest.skip('none')
     def test_thread_sincronization_across_processes(self):
         warnings.simplefilter("ignore", ResourceWarning) # ignore subprocess' left PIPES warning
         tmpfile = make_temp_pathname()
