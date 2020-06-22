@@ -17,14 +17,10 @@ The `pymutex.SharedMutex` implements the features that allows mutexes to be shar
 
 `SharedMutex.unlock()` unlocks/releases the mutex, in effect it becomes available.<br>
 The mutex is also unlocked when left locked and collected by the gargabe collector (GC), since it is understood that if there is no reference to a mutex, it is not being used. Also it would become a deadlock.<br>
-```python
-import pymutex
 
-mutex = pymutex.SharedMutex('my_mutex')
-mutex.lock()
-mutex = None # there are no more references to the mutex, it will be unlocked when collected by the GC
-```
+`SharedMutex` uses a [logger][5] named `pymutex.SharedMutex` to log important events, this logger can be enabled with default configs by calling `pymutex.configure_default_logging()`. The default logger contains only one handler (StreamHandler) that logs to stdout.
 
+### Example
 The following code shows a classic example of data races. There are 2 threads that concurrently tries to
 increment and decrement the counter's value. Python grants atomic operations on its data types, but it
 won't try to coordinate the concurrent access to the counter's value, it is up to the application code.
@@ -72,7 +68,7 @@ Remove the `mutex.lock()` and `mutex.unlock()` from the `increment` and `decreme
 ## Undefined behaviors
 The POSIX's mutex configured with robustness and errorcheck type (internally identified as `PTHREAD_MUTEX_ROBUST_ERRORCHECK_NP` by pthread) is able to avoid several deadlock situations like 1) a thread holding the lock terminates without releasing it 2) a thread tries to lock an already owned lock 3) a thread tries to unlock a not owned lock, but it only works for valid mutexes. If a __mutex is locked and collected by the Python's garbage collector before the owner thread terminates__, all operations on the mutex after that are undefined behavior. A [weakref finalizer][2] is registered for each instance of `SharedMutex` that notifies applications through logging when a mutex is left locked.
 
-Since the `SharedMutex` is supposed to be shared across processes, the underlying pthread mutex will be never destoyed by calling `pthread_mutex_destroy`. The `SharedMutex` does not keeps track of the references to the same mutex, it just makes sure it will not leave the mutex in an invalid state. Internally all [pthread_mutex_destroy][4] does is just set the mutex type to an invalid value (-1), but before doing so it checks whether the mutex is robust, if it is and some other thread is waiting for this mutex, it returns `EBUSY` error. All other operations of `_timedlock`, `_trylock` and `_unlock` checks the mutex type to select the appropriate action. When the type can't be determined, `EINVAL` error is returned. But those checks are not done when initializing a mutex, __calling `pthread_mutex_init` in an already initialized mutex causes undefined behaviors__.
+Since the `SharedMutex` is supposed to be shared across processes, the underlying pthread mutex will be never destoyed by calling `pthread_mutex_destroy`. The `SharedMutex` does not keeps track of the references to the same mutex, it just makes sure it will not leave the mutex in an invalid state. Internally all [pthread_mutex_destroy][4] does is just set the mutex type to an invalid value (-1), but before doing so it checks whether the mutex is robust, if it is and some other thread is waiting for this mutex, it returns `EBUSY` error. All other operations of `_timedlock`, `_trylock` and `_unlock` checks the mutex type to select the appropriate action. When the type can't be determined, `EINVAL` error is returned. But those checks are not done when initializing a mutex, __calling `pthread_mutex_init` in an already initialized shared mutex may cause undefined behaviors__.
 
 The mutex's state is stored in a file which is memory mapped by processes that want to use them. Applications MUST ensure that all writes to that file will not make the mutex invalid. Ideally that file should be written only by `pthread_mutex_*` functions. The `SharedMutex` class gives write and read permissions only to the process's user where the mutex was initialized. This file MUST NOT persist more than one session, applications MUST remove the file when all threads interested in terminates. Internally pthread uses threads' ID and other volatile values, those values changes when the processes restart. __Operating an invalid mutex causes undefined behaviors__.
 
@@ -91,3 +87,4 @@ This work is licensed under MIT License, See LICENSE for more info.
 [2]: https://docs.python.org/3.7/library/weakref.html#weakref.finalize
 [3]: http://sourceware.org/git/?p=glibc.git;a=tree;f=nptl;hb=HEAD
 [4]: http://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/pthread_mutex_destroy.c;h=e2c9f8a39ffe81e046f370c34e86a3696bb431e9;hb=HEAD
+[5]: https://docs.python.org/3/library/logging.html#logger-objects
